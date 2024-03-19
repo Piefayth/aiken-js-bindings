@@ -5,3 +5,7 @@ good luck
 please pr 
 
 only for browser atm
+
+install
+
+`npm install aiken-js-bindings`
