@@ -89,6 +89,13 @@ impl CompilerError {
         }
     }
 
+    pub fn line(&self) -> usize {
+        match self {
+            CompilerError::Parse(p) => p.span.start,
+            CompilerError::Type(_) => 0 // TODO: we can get the line number for certain errors
+        }
+    }
+
     pub fn code(&self) -> Option<String> {
         match self {
             CompilerError::Parse(p) => p.code().map(|pc| pc.to_string()),
@@ -148,14 +155,15 @@ struct CompilerErrorInfo {
     code: Option<String>,
     message: String,
     help: Option<String>,
+    line: usize // cursed, the value of this actually is "character_number" not "line_number" rn 
 }
 impl From<CompilerError> for CompilerErrorInfo {
     fn from(error: CompilerError) -> Self {
         CompilerErrorInfo {
-            // Assuming you have a way to get the line number from the error
             message: error.message(),
             help: error.help(),
             code: error.code(),
+            line: error.line(),
         }
     }
 }
@@ -517,8 +525,7 @@ fn run_tests(
         let program = generator.generate_test(&test.body);
         let program: Program<NamedDeBruijn> = program.try_into().unwrap();
         let mut eval_result = program.eval(ExBudget::default());
-
-
+        
         TestResult {
             success: !eval_result.failed(test.can_error),
             spent_budget: eval_result.cost(),
