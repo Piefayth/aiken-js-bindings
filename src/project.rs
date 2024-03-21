@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::sync::Arc;
 use std::{collections::HashMap};
-use aiken_lang::ast::BinOp;
+use aiken_lang::ast::{Arg, BinOp};
+use aiken_lang::tipo::Type;
 use aiken_lang::{
     ast::{Definition, ModuleKind, Tracing, TypedDataType, TypedDefinition, TypedFunction, TypedValidator},
     builtins, gen_uplc::{builder::{DataTypeKey, FunctionAccessKey}, CodeGenerator}, parser::{self, error::{ErrorKind, ParseError}}, tipo::{self, error::Warning, TypeInfo}, IdGenerator,
@@ -8,12 +10,51 @@ use aiken_lang::{
 use indexmap::IndexMap;
 use uplc::ast::{DeBruijn, NamedDeBruijn, Program};
 use uplc::machine::cost_model::ExBudget;
+use uplc::ast::Type as UplcType;
 use wasm_bindgen::prelude::*;
 use web_sys::console;
 use serde::{Serialize, Deserialize};
 use miette::Diagnostic;
 
 use crate::{stdlib};
+
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "dataType", content = "value")]
+enum SerializableUplcType {
+    Bool,
+    Integer,
+    String,
+    ByteString,
+    Unit,
+    List(Box<SerializableUplcType>),
+    Pair(Box<SerializableUplcType>, Box<SerializableUplcType>),
+    Data,
+}
+
+impl From<&UplcType> for SerializableUplcType {
+    fn from(t: &UplcType) -> Self {
+        match t {
+            UplcType::Bool => SerializableUplcType::Bool,
+            UplcType::Integer => SerializableUplcType::Integer,
+            UplcType::String => SerializableUplcType::String,
+            UplcType::ByteString => SerializableUplcType::ByteString,
+            UplcType::Unit => SerializableUplcType::Unit,
+            UplcType::List(sub_type) => {
+                SerializableUplcType::List(Box::new(SerializableUplcType::from(sub_type.as_ref())))
+            }
+            UplcType::Pair(type1, type2) => {
+                SerializableUplcType::Pair(
+                    Box::new(SerializableUplcType::from(type1.as_ref())),
+                    Box::new(SerializableUplcType::from(type2.as_ref()))
+                )
+            }
+            UplcType::Data => SerializableUplcType::Data,
+            // Handle other types recursively as needed
+        }
+    }
+}
 
 pub struct EvalHint {
     pub bin_op: BinOp,
@@ -64,7 +105,7 @@ impl CompilerError {
 }
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct CompilerWarning {
     line: usize,
     message: String,
@@ -102,7 +143,7 @@ impl From<Warning> for CompilerWarning {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct CompilerErrorInfo {
     code: Option<String>,
     message: String,
@@ -119,14 +160,16 @@ impl From<CompilerError> for CompilerErrorInfo {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct ValidatorResult {
     index: usize,
     name: String,
+    parameter_types: Vec<SerializableUplcType>,
     program: String,
 }
 
 #[derive(Serialize)]
+#[wasm_bindgen]
 struct BuildResult {
     success: bool,
     warnings: Vec<CompilerWarning>,
@@ -134,6 +177,14 @@ struct BuildResult {
     validators: Vec<ValidatorResult>,
     test_results: Vec<TestResult>,
     // Add more fields as necessary
+}
+
+#[derive(Serialize)]
+#[wasm_bindgen]
+struct FormatResult {
+    success: bool,
+    formatted_code: Option<String>,
+    errors: Vec<CompilerErrorInfo>,
 }
 
 #[wasm_bindgen]
@@ -166,7 +217,7 @@ impl Project {
         }
     }
 
-    pub fn build(&mut self, source_code: &str) -> Result<JsValue, JsValue> {
+    pub fn build(&mut self, source_code: &str, should_run_tests: bool) -> Result<JsValue, JsValue> {
         self.setup_stdlib();
 
         let kind = ModuleKind::Validator;
@@ -189,8 +240,12 @@ impl Project {
                         let (tests, validators, functions, data_types) = self.collect_definitions(name.clone(), typed_ast.definitions());
 
                         let mut generator = CodeGenerator::new(functions, data_types, module_types, false);
-
-                        let test_results = run_tests(tests, &mut generator);
+                        
+                        let test_results = if should_run_tests {
+                            run_tests(tests, &mut generator)
+                        } else {
+                            vec![]
+                        };
 
                         for (index, validator) in validators.into_iter().enumerate() {
                             let name = format!(
@@ -203,6 +258,15 @@ impl Project {
                                     .unwrap_or_else(|| "".to_string())
                             );
 
+                            let parameter_types: Vec<SerializableUplcType> = validator.params.clone().into_iter().map(|elem| {
+                                let uplc_type = elem.tipo.get_uplc_type();
+                                let pretty = elem.tipo.to_pretty(4);
+                                let param_variable_name = elem.get_variable_name();
+                                elem.tipo.to_pretty(0);
+                                //console::log_1(&format!("{}", pretty).into());
+                                SerializableUplcType::from(&uplc_type)
+                            }).collect();
+
                             let program = generator.generate(validator);
 
                             let program: Program<DeBruijn> = program.try_into().unwrap();
@@ -212,7 +276,8 @@ impl Project {
                             validators_results.push(ValidatorResult {
                                 index,
                                 name,
-                                program
+                                program,
+                                parameter_types
                             });
                         }
 
@@ -271,19 +336,45 @@ impl Project {
         }
     }
 
-    // TODO: Format!
+    pub fn format(&self, source_code: &str) -> Result<JsValue, JsValue> {
+        let parse_result = parser::module(source_code, ModuleKind::Validator);
 
-    // pub fn format(source_code: &str) -> Result<String, JsValue> {
-    //     let parse_result = parser::module(source_code, ModuleKind::Validator);
+        match parse_result {
+            Ok((ast, extra)) => {
+                let mut output = String::new();
 
-    //     match parse_result {
-    //         Ok((ast, _)) => {
-    //             let formatted_code = aiken_lang::format::pretty(&ast); // Assuming a function that formats the code
-    //             Ok(formatted_code)
-    //         },
-    //         Err(e) => Err(JsValue::from_str(&format!("Format error: {:?}", e))),
-    //     }
-    // }
+                aiken_lang::format::pretty(&mut output, ast, extra, source_code); // Assuming a function that formats the code
+                
+                let format_result = FormatResult {
+                    success: true,
+                    errors: vec![],
+                    formatted_code: Some(output)
+                };
+
+                match serde_wasm_bindgen::to_value(&format_result) {
+                    Ok(js_value) => Ok(js_value),
+                    Err(e) => Err(JsValue::from_str(&e.to_string())),
+                }
+            },
+            Err(errs) => {
+                let format_errors: Vec<CompilerErrorInfo> = errs.into_iter()
+                    .map(CompilerError::Parse)
+                    .map(CompilerErrorInfo::from)
+                    .collect();
+
+                let format_result = FormatResult {
+                    success: true,
+                    errors: format_errors,
+                    formatted_code: None
+                };
+
+                match serde_wasm_bindgen::to_value(&format_result) {
+                    Ok(js_value) => Ok(js_value),
+                    Err(e) => Err(JsValue::from_str(&e.to_string())),
+                }
+            }
+        }
+    }
 
 
     pub fn setup_stdlib(&mut self) {
